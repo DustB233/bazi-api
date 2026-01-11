@@ -5,3 +5,4 @@ pytz
 lunar_python
 pyyaml
 colorama
+bidict
