@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+pytz
+lunar_python
+pyyaml
