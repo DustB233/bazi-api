@@ -1,166 +1,295 @@
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel, Field
-from typing import Optional, Literal, Dict, Any
-import datetime, math
-import pytz
+# server.py
+from __future__ import annotations
+
 import os
+import re
+import sys
+import json
+import subprocess
+from pathlib import Path
+from typing import Optional, Any, Dict
 
-# pip install lunar_python
-from lunar_python import Solar  # Lunar can be accessed via solar.getLunar()
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
+from fastapi.openapi.utils import get_openapi
 
-app = FastAPI(
-    title="BaZi True Solar API",
-    version="1.0.0",
-    description="Compute BaZi (八字) using true solar time (真太阳时) from user inputs."
-)
 
-# --- Offline minimal city table (extend as you like) ---
-CITY_LONLAT = {
-    ("qingdao", "china"): (120.3826, 36.0671),
-    ("beijing", "china"): (116.4074, 39.9042),
-    ("shanghai", "china"): (121.4737, 31.2304),
-}
+# ----------------------------
+# Config
+# ----------------------------
+DEFAULT_TOKEN_FALLBACK = "BAObao200534"  # fallback only; recommended: set env var BAZI_API_TOKEN in Render
+TOKEN_ENV_NAME = "BAZI_API_TOKEN"
 
-def equation_of_time_minutes(dt: datetime.datetime) -> float:
-    # Spencer formula approx (minutes)
-    n = dt.timetuple().tm_yday
-    B = 2.0 * math.pi * (n - 81) / 364.0
-    return 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+# Optional override:
+# If you set PUBLIC_BASE_URL in Render, OpenAPI will use it (best for Custom GPT Actions).
+PUBLIC_BASE_URL_ENV_NAME = "PUBLIC_BASE_URL"
 
-def to_true_solar_datetime(local_dt: datetime.datetime, lon_deg: float, tz: pytz.BaseTzInfo, use_dst: bool = False) -> datetime.datetime:
+# Render automatically provides this for deployed services (fallback)
+RENDER_EXTERNAL_URL_ENV_NAME = "RENDER_EXTERNAL_URL"
+
+
+def _expected_token() -> str:
+    return (os.getenv(TOKEN_ENV_NAME, DEFAULT_TOKEN_FALLBACK) or "").strip()
+
+
+def _check_auth(auth: Optional[str]) -> None:
     """
-    TrueSolar ≈ StandardTime + 4*(lon - LSTM) + EoT  (minutes)
+    Accept either:
+      - Authorization: Bearer <token>
+      - Authorization: <token>
     """
-    if local_dt.tzinfo is None:
-        local_dt = tz.localize(local_dt)
-    else:
-        local_dt = local_dt.astimezone(tz)
+    expected = _expected_token()
+    if not expected:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{TOKEN_ENV_NAME} is not set and fallback token is empty.",
+        )
 
-    offset = local_dt.utcoffset()
-    offset_hours = (offset.total_seconds() / 3600.0) if offset else 0.0
-    if (not use_dst) and bool(local_dt.dst()):
-        offset_hours -= 1.0
+    if not auth:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    lstm = 15.0 * offset_hours  # Local Standard Time Meridian
-    eot = equation_of_time_minutes(local_dt.replace(tzinfo=None))
-    tc = 4.0 * (lon_deg - lstm) + eot
-    return local_dt.replace(tzinfo=None) + datetime.timedelta(minutes=tc)
+    got = auth.strip()
+    if got.lower().startswith("bearer "):
+        got = got.split(" ", 1)[1].strip()
 
-def parse_time(s: str) -> tuple[int,int,int]:
-    s = s.strip()
-    if ":" not in s and s.count(".") == 1:
-        # accept HH.MM
-        s = s.replace(".", ":", 1)
-    parts = s.split(":")
-    if len(parts) == 1:
-        h, m, sec = parts[0], "0", "0"
-    elif len(parts) == 2:
-        h, m, sec = parts[0], parts[1], "0"
-    elif len(parts) == 3:
-        h, m, sec = parts
-    else:
-        raise ValueError("time must be HH or HH:MM or HH:MM:SS")
-    hi, mi, si = int(h), int(m), int(sec)
-    if not (0 <= hi <= 23 and 0 <= mi <= 59 and 0 <= si <= 59):
-        raise ValueError("invalid time range")
-    return hi, mi, si
+    if got != expected:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
+
+def _public_base_url() -> str:
+    """
+    Priority:
+      1) PUBLIC_BASE_URL (you set)
+      2) RENDER_EXTERNAL_URL (Render sets)
+      3) localhost fallback
+    """
+    for k in (PUBLIC_BASE_URL_ENV_NAME, RENDER_EXTERNAL_URL_ENV_NAME):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v.rstrip("/")
+    return "http://localhost:8000"
+
+
+def _find_script_path() -> str:
+    """
+    Prefer bazi_true_solar_v2.py in the same folder as this server.py.
+    If user renamed it, attempt a best-effort lookup.
+    """
+    here = Path(__file__).resolve().parent
+    preferred = here / "bazi_true_solar_v2.py"
+    if preferred.exists():
+        return str(preferred)
+
+    candidates = list(here.glob("bazi_true_solar*"))
+    py_candidates = [p for p in candidates if p.suffix == ".py"]
+    if py_candidates:
+        py_candidates.sort(key=lambda p: (("v2" not in p.stem.lower()), len(p.stem)))
+        return str(py_candidates[0])
+
+    raise RuntimeError("Could not find bazi_true_solar_v2.py next to server.py")
+
+
+SCRIPT_PATH = _find_script_path()
+
+
+# ----------------------------
+# Request/Response Models
+# ----------------------------
 class BaziRequest(BaseModel):
-    calendar: Literal["gregorian"] = "gregorian"  # keep it simple at first
+    calendar: str = Field(default="gregorian", description="gregorian or lunar")
     year: int
     month: int
     day: int
-    time: str = Field(..., description="HH or HH:MM or HH:MM:SS (also accepts HH.MM)")
-    gender: Literal["male", "female"] = "male"
+    time: str = Field(description="HH or HH:MM or HH:MM:SS (also accepts HH.MM)")
 
-    # location input: either city/country or lon/lat
+    gender: str = Field(default="male", description="male or female")
+
     city: Optional[str] = None
     country: Optional[str] = None
-    lon: Optional[float] = Field(None, description="Longitude (east positive). Preferred for accuracy.")
+    tz: Optional[str] = Field(default=None, description="IANA timezone like Asia/Shanghai")
+    lon: Optional[float] = None
     lat: Optional[float] = None
+    geocode: bool = Field(
+        default=False,
+        description="Try online geocoding (may fail). Prefer lon/lat or built-in table.",
+    )
+    use_dst: bool = Field(default=False, description="Include DST in standard meridian calc (default false)")
 
-    tz: Optional[str] = Field(None, description="IANA timezone like Asia/Shanghai. If omitted and country==China -> Asia/Shanghai.")
-    use_dst: bool = False
+    leap_month: bool = Field(default=False, description="For lunar calendar only (-r)")
+
+    start: int = 1850
+    end: int = 2030
+
 
 class BaziResponse(BaseModel):
     input: Dict[str, Any]
     resolved: Dict[str, Any]
-    times: Dict[str, str]
-    bazi: Dict[str, Any]
+    parsed: Dict[str, Any]
+    stdout: str
+    stderr: str
+    returncode: int
 
-def resolve_lon_lat(req: BaziRequest) -> tuple[float, Optional[float], str]:
-    if req.lon is not None:
-        return req.lon, req.lat, "user_lonlat"
-    if req.city and req.country:
-        key = (req.city.strip().lower(), req.country.strip().lower())
-        if key in CITY_LONLAT:
-            lon, lat = CITY_LONLAT[key]
-            return lon, lat, "builtin_city_table"
-    raise HTTPException(status_code=400, detail="Need lon (recommended) or a supported city+country in builtin table.")
 
-def resolve_tz(req: BaziRequest) -> pytz.BaseTzInfo:
-    if req.tz:
-        try:
-            return pytz.timezone(req.tz)
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"Invalid tz: {req.tz}")
-    # minimal default rule:
-    if (req.country or "").strip().lower() == "china":
-        return pytz.timezone("Asia/Shanghai")
-    raise HTTPException(status_code=400, detail="Please provide tz (e.g., Asia/Shanghai).")
+# ----------------------------
+# FastAPI App
+# ----------------------------
+app = FastAPI(
+    title="BaZi True Solar API",
+    version="1.0.0",
+    description="Compute BaZi (八字) using true solar time (真太阳时) by running bazi_true_solar_v2.py and returning its full output.",
+)
 
-def compute_bazi_true_solar(req: BaziRequest) -> dict:
-    tz = resolve_tz(req)
-    lon, lat, src = resolve_lon_lat(req)
 
-    h, m, s = parse_time(req.time)
-    local_civil = datetime.datetime(req.year, req.month, req.day, h, m, s)
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
 
-    true_solar = to_true_solar_datetime(local_civil, lon, tz, use_dst=req.use_dst)
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=getattr(app, "description", None),
+        routes=app.routes,
+    )
 
-    # use true solar time to build Solar -> Lunar -> EightChar
-    solar_true = Solar.fromYmdHms(true_solar.year, true_solar.month, true_solar.day, true_solar.hour, true_solar.minute, true_solar.second)
-    lunar = solar_true.getLunar()
-    ba = lunar.getEightChar()
+    schema["servers"] = [{"url": _public_base_url()}]
 
-    # pillars
-    y_gan, y_zhi = ba.getYearGan(), ba.getYearZhi()
-    m_gan, m_zhi = ba.getMonthGan(), ba.getMonthZhi()
-    d_gan, d_zhi = ba.getDayGan(), ba.getDayZhi()
-    t_gan, t_zhi = ba.getTimeGan(), ba.getTimeZhi()
+    # Helps Custom GPT Actions not ask “Are you sure?” before POST
+    try:
+        schema["paths"]["/bazi/compute"]["post"]["x-openai-isConsequential"] = False
+    except Exception:
+        pass
 
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+@app.get("/")
+def root():
     return {
-        "input": req.model_dump(),
-        "resolved": {"lon": lon, "lat": lat, "lonlat_source": src, "tz": tz.zone},
-        "times": {
-            "civil_local": local_civil.strftime("%Y-%m-%d %H:%M:%S"),
-            "true_solar": true_solar.strftime("%Y-%m-%d %H:%M:%S"),
-            "solar_used": solar_true.toYmdHms() if hasattr(solar_true, "toYmdHms") else true_solar.strftime("%Y-%m-%d %H:%M:%S"),
-        },
-        "bazi": {
-            "pillars": {
-                "year": {"gan": y_gan, "zhi": y_zhi, "gz": f"{y_gan}{y_zhi}"},
-                "month": {"gan": m_gan, "zhi": m_zhi, "gz": f"{m_gan}{m_zhi}"},
-                "day": {"gan": d_gan, "zhi": d_zhi, "gz": f"{d_gan}{d_zhi}"},
-                "hour": {"gan": t_gan, "zhi": t_zhi, "gz": f"{t_gan}{t_zhi}"},
-            },
-            "day_master": d_gan,
-        },
+        "ok": True,
+        "message": "BaZi True Solar API is running. Use POST /bazi/compute. OpenAPI: /openapi.json",
     }
 
-def check_bearer(auth: Optional[str]) -> None:
-    EXPECTED = os.getenv("BAZI_API_TOKEN")
-    if not EXPECTED:
-        raise HTTPException(status_code=500, detail="Server missing BAZI_API_TOKEN")
 
-    if not auth or not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
-    token = auth.split(" ", 1)[1].strip()
-    if token != EXPECTED:
-        raise HTTPException(status_code=403, detail="Invalid token")
+
+@app.get("/openapi.yaml", response_class=PlainTextResponse)
+def openapi_yaml():
+    """
+    Convenience endpoint: returns the OpenAPI JSON as text.
+    (If you really want YAML, generate it offline; GPT Actions accepts JSON too.)
+    """
+    return PlainTextResponse(json.dumps(app.openapi(), ensure_ascii=False, indent=2), media_type="text/plain")
+
+
+def _run_v2_script(req: BaziRequest) -> Dict[str, Any]:
+    cmd = [sys.executable, SCRIPT_PATH]
+
+    cal = (req.calendar or "gregorian").strip().lower()
+    if cal not in ("gregorian", "lunar"):
+        raise HTTPException(status_code=422, detail="calendar must be 'gregorian' or 'lunar'")
+
+    if cal == "gregorian":
+        cmd.append("-g")
+    else:
+        if req.leap_month:
+            cmd.append("-r")
+
+    gender = (req.gender or "male").strip().lower()
+    if gender not in ("male", "female"):
+        raise HTTPException(status_code=422, detail="gender must be 'male' or 'female'")
+    if gender == "female":
+        cmd.append("-n")
+
+    cmd += ["--start", str(req.start), "--end", str(req.end)]
+    cmd += [str(req.year), str(req.month), str(req.day), str(req.time)]
+
+    if req.city:
+        cmd += ["--city", req.city]
+    if req.country:
+        cmd += ["--country", req.country]
+    if req.tz:
+        cmd += ["--tz", req.tz]
+    if req.lon is not None:
+        cmd += ["--lon", str(req.lon)]
+    if req.lat is not None:
+        cmd += ["--lat", str(req.lat)]
+    if req.geocode:
+        cmd.append("--geocode")
+    if req.use_dst:
+        cmd.append("--use_dst")
+
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Computation timed out")
+
+    return {
+        "cmd": cmd,
+        "returncode": p.returncode,
+        "stdout": p.stdout or "",
+        "stderr": p.stderr or "",
+    }
+
+
+def _parse_key_bits(stdout: str) -> Dict[str, Any]:
+    parsed: Dict[str, Any] = {}
+
+    m1 = re.search(r"输入钟表时间:\s*(.+)", stdout)
+    if m1:
+        parsed["civil_clock_time_line"] = m1.group(1).strip()
+
+    m2 = re.search(
+        r"真太阳时:\s*([0-9:\-\s]+)\s*\(lon=([0-9\.\-]+),\s*src=([^,]+),\s*tz=([^)]+)\)",
+        stdout,
+    )
+    if m2:
+        parsed["true_solar_time"] = m2.group(1).strip()
+        parsed["longitude"] = float(m2.group(2))
+        parsed["lonlat_source"] = m2.group(3).strip()
+        parsed["timezone"] = m2.group(4).strip()
+
+    return parsed
+
 
 @app.post("/bazi/compute", response_model=BaziResponse)
 def compute(req: BaziRequest, authorization: Optional[str] = Header(default=None)):
-    check_bearer(authorization)
-    return compute_bazi_true_solar(req)
+    _check_auth(authorization)
+
+    result = _run_v2_script(req)
+
+    if result["returncode"] != 0:
+        detail = result["stderr"].strip() or result["stdout"].strip() or "bazi_true_solar_v2.py failed"
+        raise HTTPException(status_code=400, detail=detail)
+
+    parsed = _parse_key_bits(result["stdout"])
+
+    resolved = {
+        "script_path": SCRIPT_PATH,
+        "python": sys.executable,
+        "argv": result["cmd"],
+        "base_url_for_openapi": _public_base_url(),
+        "note": "stdout is the full original output of bazi_true_solar_v2.py (authoritative).",
+    }
+
+    return BaziResponse(
+        input=req.model_dump(),
+        resolved=resolved,
+        parsed=parsed,
+        stdout=result["stdout"],
+        stderr=result["stderr"],
+        returncode=result["returncode"],
+    )
