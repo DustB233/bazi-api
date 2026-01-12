@@ -26,7 +26,7 @@ from sizi import summarys
 from common import *
 from yue import months
 
-from city_lonlat import _CITY_LONLAT as _CITY_LONLAT, make_key
+from city_lonlat import CITY_LONLAT as _CITY_LONLAT
 
 def _lookup_city_lonlat(city: str, country: str):
     return _CITY_LONLAT.get(make_key(city, country))
